@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ResourceManager.HardwareBridge</AssemblyName>
+    <RootNamespace>ResourceManager.HardwareBridge</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- 独立发布：主程序通过依赖页下载它，不应该再要求装运行时。 -->
+    <SelfContained>false</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Platforms>AnyCPU;x64</Platforms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      ZenStates-Core 是 GPL-3.0。整个程序也按 GPL-3.0 发布，所以引用它没有问题；
+      主程序不引用这个项目，只通过标准输入输出跟它说话。
+    -->
+    <ProjectReference Include="..\..\external\ZenStates-Core\ZenStates-Core.csproj" />
+  </ItemGroup>
+
+</Project>
