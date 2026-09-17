@@ -52,6 +52,8 @@ static Dictionary<string, object?> Handle(CpuSession session, string line)
         {
             "describe" => Ok(id, session.Describe()),
             "read" => Ok(id, session.Read()),
+            // 诊断用：把 PM table 原样倒出来，用来确认这一代处理器的表布局。
+            "dump-power-table" => Ok(id, session.DumpPowerTable(32)),
             "set-power-limit" => Ok(id, session.SetPowerLimit(
                 Text(request, "which"),
                 Number(request, "watts"))),

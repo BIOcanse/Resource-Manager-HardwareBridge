@@ -53,6 +53,29 @@ internal sealed class CpuSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// PM table 的前若干项，**原样**给出来。
+    ///
+    /// 各代处理器的表布局不一样，照着别家的索引表硬套会读出一个看着像功耗、
+    /// 其实是别的东西的数。要接新字段之前先用这个把表倒出来，
+    /// 和已知量（STAPM 上限、当前包功耗……）对上号再说。
+    /// </summary>
+    public IReadOnlyDictionary<string, object?> DumpPowerTable(int count)
+    {
+        var table = ReadTable() ?? throw new InvalidOperationException("读不到 PM table。");
+        var take = Math.Clamp(count, 1, table.Length);
+        var values = new double[take];
+        for (var index = 0; index < take; index++)
+        {
+            values[index] = table[index];
+        }
+        return new Dictionary<string, object?>
+        {
+            ["length"] = table.Length,
+            ["values"] = values
+        };
+    }
+
     /// <summary>这台机器上有什么、能设什么。主程序据此决定界面上出现哪几项。</summary>
     public IReadOnlyDictionary<string, object?> Describe()
     {
@@ -72,6 +95,8 @@ internal sealed class CpuSession : IDisposable
             ["codeName"] = cpu.info.codeName.ToString(),
             ["status"] = cpu.Status.ToString(),
             ["smuVersion"] = cpu.smu.Version,
+            // PM table 的版本号。表布局按它区分 —— 主程序那边的索引表就是拿它当键的。
+            ["powerTableVersion"] = cpu.GetTableVersion().TableVersion,
             ["powerTable"] = ReadTable() is not null,
             // 命令号为 0 表示这代处理器上没有这条命令。
             ["curveOptimizer"] = cpu.smu.Rsmu.SMU_MSG_SetDldoPsmMargin != 0
@@ -91,8 +116,35 @@ internal sealed class CpuSession : IDisposable
             ["fastLimitWatts"] = table[FastLimitIndex],
             ["slowLimitWatts"] = table[SlowLimitIndex],
             ["curveOptimizerCounts"] = ReadCurveOptimizer(),
-            ["integratedGpuCurveOptimizerCounts"] = ReadIntegratedGpuCurveOptimizer()
+            ["integratedGpuCurveOptimizerCounts"] = ReadIntegratedGpuCurveOptimizer(),
+            ["maxBoostFrequencyMhz"] = ReadMaxBoostFrequency()
         };
+    }
+
+    /// <summary>
+    /// 这颗处理器的**加速频率上限**，单位 MHz。
+    ///
+    /// Windows 那边给不出这个数：<c>Win32_Processor.MaxClockSpeed</c>、
+    /// PDH 的 <c>Processor Frequency</c>、注册表 <c>~MHz</c> 报的都是**标称频率**
+    /// （本机三个都是 2401），而 <c>% of Maximum Frequency</c> 比的是电源计划
+    /// 当前允许的上限，不是加速上限。
+    ///
+    /// 所以问 SMU。读不到就是 null —— 调用方据此如实说"没有参考值"，
+    /// 不拿标称频率冒充加速频率。
+    /// </summary>
+    private double? ReadMaxBoostFrequency()
+    {
+        try
+        {
+            var value = cpu?.GetFMax() ?? 0;
+            // 0 表示这一代处理器的 RSMU 表里没有这条命令；
+            // 超出常识范围的值说明读到的不是频率。
+            return value is > 0 and < 10_000 ? value : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     /// <summary>
