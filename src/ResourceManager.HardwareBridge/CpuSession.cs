@@ -104,20 +104,49 @@ internal sealed class CpuSession : IDisposable
     public IReadOnlyDictionary<string, object?> SetPowerLimit(string which, double watts)
     {
         var target = Require();
-        var milliwatts = (uint)Math.Round(watts * 1000);
-        var status = which switch
+
+        /*
+         * 直接发 MP1。
+         *
+         * ZenStates 的通用路径是「先发 RSMU，OK 就不再试 MP1」，而 Zen4 移动端上
+         * RSMU 会回一个假的 OK（SetStapmLimit 的 RSMU 命令号在 Zen4 表里干脆是 0），
+         * 于是真正管用的 MP1 永远轮不到 —— 实测写完 PM table 纹丝不动。
+         *
+         * 命令号仍然用它维护的表（Mp1Smu.SMU_MSG_*），只是换一个邮箱，不硬写常量。
+         * 表里没有这条命令时才退回它的通用接口。
+         */
+        var mp1Message = which switch
         {
-            "stapm" => target.SetStapmLimit(milliwatts),
-            "slow" => target.SetSlowLimit(milliwatts),
-            "fast" => target.SetFastLimit(milliwatts),
+            "stapm" => target.smu.Mp1Smu.SMU_MSG_SetStapmLimit,
+            "slow" => target.smu.Mp1Smu.SMU_MSG_SetSlowLimit,
+            "fast" => target.smu.Mp1Smu.SMU_MSG_SetFastLimit,
             _ => throw new ArgumentException($"不认识的功耗项：{which}。")
         };
+
+        SMU.Status status;
+        if (mp1Message != 0)
+        {
+            var arguments = Utils.MakeCmdArgs((uint)Math.Round(watts * 1000));
+            status = target.smu.SendMp1Command(mp1Message, ref arguments);
+        }
+        else
+        {
+            // 它的通用接口收的是**瓦**，内部自己乘 1000。
+            var value = (uint)Math.Round(watts);
+            status = which switch
+            {
+                "stapm" => target.SetStapmLimit(value),
+                "slow" => target.SetSlowLimit(value),
+                _ => target.SetFastLimit(value)
+            };
+        }
 
         // 只回原始状态码和回读值。算不算写成功，主程序自己比。
         var table = ReadTable();
         return new Dictionary<string, object?>
         {
             ["status"] = status.ToString(),
+            ["mailbox"] = mp1Message != 0 ? "mp1" : "library",
             ["stapmLimitWatts"] = table?[StapmLimitIndex],
             ["fastLimitWatts"] = table?[FastLimitIndex],
             ["slowLimitWatts"] = table?[SlowLimitIndex]
