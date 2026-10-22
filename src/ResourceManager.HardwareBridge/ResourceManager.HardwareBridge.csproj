@@ -9,9 +9,11 @@
     <RootNamespace>ResourceManager.HardwareBridge</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
     <!-- 独立发布：主程序通过依赖页下载它，不应该再要求装运行时。 -->
-    <SelfContained>false</SelfContained>
+    <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <Platforms>AnyCPU;x64</Platforms>
+    <PublishSingleFile Condition="'$(RuntimeIdentifier)' != ''">true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>
@@ -22,4 +24,17 @@
     <ProjectReference Include="..\..\external\ZenStates-Core\ZenStates-Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="../../LICENSE" Link="LICENSE" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+  </ItemGroup>
+
+  <!-- 引用项目和桥本体的许可证分别保留，避免相同发布路径冲突。 -->
+  <Target Name="SeparateDependencyLicense" BeforeTargets="_HandleFileConflictsForPublish">
+    <ItemGroup>
+      <ResolvedFileToPublish Condition="'%(ResolvedFileToPublish.FullPath)' == '$([System.IO.Path]::GetFullPath($(MSBuildProjectDirectory)/../../external/ZenStates-Core/LICENSE))'">
+        <RelativePath>ThirdPartyNotices/ZenStates-Core.LICENSE</RelativePath>
+        <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
 </Project>

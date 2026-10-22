@@ -17,6 +17,13 @@
 using System.Text.Json;
 using ResourceManager.HardwareBridge;
 
+// Packaging smoke check exits before any hardware discovery or session is opened.
+if (args.Length == 1 && args[0] == "--runtime-check")
+{
+    Console.WriteLine("{\"runtimeReady\":true}");
+    return;
+}
+
 // 标准输入一行一条请求，标准输出一行一条应答。
 // 父进程关掉标准输入，这个进程就结束 —— 生命周期跟着主程序，不留后台。
 using var session = new CpuSession();
@@ -53,13 +60,27 @@ static Dictionary<string, object?> Handle(CpuSession session, string line)
             "describe" => Ok(id, session.Describe()),
             "read" => Ok(id, session.Read()),
             // 诊断用：把 PM table 原样倒出来，用来确认这一代处理器的表布局。
-            "dump-power-table" => Ok(id, session.DumpPowerTable(32)),
+            "dump-power-table" => Ok(id, session.DumpPowerTable(
+                request.TryGetProperty("offset", out var offsetElement)
+                    ? (int)offsetElement.GetDouble()
+                    : 0,
+                request.TryGetProperty("count", out var countElement)
+                    ? (int)countElement.GetDouble()
+                    : 32)),
             "set-power-limit" => Ok(id, session.SetPowerLimit(
                 Text(request, "which"),
-                Number(request, "watts"))),
-            "set-curve-optimizer" => Ok(id, session.SetCurveOptimizer((int)Number(request, "counts"))),
-            "set-igpu-curve-optimizer" =>
-                Ok(id, session.SetIntegratedGpuCurveOptimizer((int)Number(request, "counts"))),
+                Value(request))),
+            "set-current-limit" => Ok(id, session.SetCurrentLimit(
+                Text(request, "which"),
+                Value(request))),
+            "set-temperature-limit" => Ok(id, session.SetTemperatureLimit(Value(request))),
+            "set-pbo-scalar" => Ok(id, session.SetPowerBoostScalar(Value(request))),
+            // 档位是无量纲的整数，但一样要带着单位过来 —— 统一一条规矩，
+            // 不留"这一条可以不带"的例外，例外就是下一次搞错的入口。
+            "set-curve-optimizer" => Ok(id, session.SetCurveOptimizer(
+                (int)Value(request).In(SmuUnits.Step))),
+            "set-igpu-curve-optimizer" => Ok(id, session.SetIntegratedGpuCurveOptimizer(
+                (int)Value(request).In(SmuUnits.Step))),
             _ => Error(id, $"不认识的操作：{operation}")
         };
     }
@@ -75,6 +96,16 @@ static string Text(JsonElement request, string name)
     => request.TryGetProperty(name, out var element) && element.GetString() is { } value
         ? value
         : throw new ArgumentException($"这条请求缺少 {name}。");
+
+/// <summary>
+/// 一条写入请求里的那个值，**连同它的单位**。
+///
+/// 单位是必填的：没有单位的数字到了 SMU 那一侧就只能靠参数名猜量纲，
+/// 而猜错不会报错，只会安静地改坏硬件。主程序那边每条设定本来就带着单位，
+/// 照原样传过来即可。
+/// </summary>
+static SmuValue Value(JsonElement request)
+    => new(Number(request, "value"), Text(request, "unit"));
 
 static double Number(JsonElement request, string name)
     => request.TryGetProperty(name, out var element)

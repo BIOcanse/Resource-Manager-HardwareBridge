@@ -12,8 +12,7 @@ namespace ResourceManager.HardwareBridge;
 ///
 /// **不自己拼 SMU 邮箱、不自己编码 Curve Optimizer 的负值。**
 /// 各代处理器的邮箱地址、命令号、参数编码，ZenStates-Core 都在维护，
-/// 而且它会按机器情况自己选内核（开着内存完整性的机器上走 PawnIO，
-/// 因为 WinRing0 在那些机器上被驱动阻止列表挡着，根本加载不了）。
+/// 本产品限定使用 PawnIO，不装载 InpOut 或 WinIo；签名模块不可用就报告不可用。
 /// 电压这类东西调错代价很大，照着二手资料猜编码是不能接受的。
 ///
 /// **这里只暴露操作，不做判断。** 写哪几项、算不算成功、越界怎么办、
@@ -31,6 +30,13 @@ internal sealed class CpuSession : IDisposable
     private const int StapmValueIndex = 1;
     private const int FastLimitIndex = 2;
     private const int SlowLimitIndex = 4;
+
+    /// <summary>
+    /// 电流墙的位置。本机（表版本 0x00540208）实测 [6]=85、[8]=125，
+    /// 和这颗处理器的 TDC / EDC 额定值对得上。
+    /// </summary>
+    private const int TdcLimitIndex = 6;
+    private const int EdcLimitIndex = 8;
 
     private readonly Cpu? cpu;
     private readonly string? unavailableReason;
@@ -60,18 +66,20 @@ internal sealed class CpuSession : IDisposable
     /// 其实是别的东西的数。要接新字段之前先用这个把表倒出来，
     /// 和已知量（STAPM 上限、当前包功耗……）对上号再说。
     /// </summary>
-    public IReadOnlyDictionary<string, object?> DumpPowerTable(int count)
+    public IReadOnlyDictionary<string, object?> DumpPowerTable(int offset, int count)
     {
         var table = ReadTable() ?? throw new InvalidOperationException("读不到 PM table。");
-        var take = Math.Clamp(count, 1, table.Length);
+        var start = Math.Clamp(offset, 0, Math.Max(0, table.Length - 1));
+        var take = Math.Clamp(count, 1, table.Length - start);
         var values = new double[take];
         for (var index = 0; index < take; index++)
         {
-            values[index] = table[index];
+            values[index] = table[start + index];
         }
         return new Dictionary<string, object?>
         {
             ["length"] = table.Length,
+            ["offset"] = start,
             ["values"] = values
         };
     }
@@ -115,6 +123,8 @@ internal sealed class CpuSession : IDisposable
             ["stapmValueWatts"] = table[StapmValueIndex],
             ["fastLimitWatts"] = table[FastLimitIndex],
             ["slowLimitWatts"] = table[SlowLimitIndex],
+            ["tdcLimitAmps"] = table[TdcLimitIndex],
+            ["edcLimitAmps"] = table[EdcLimitIndex],
             ["curveOptimizerCounts"] = ReadCurveOptimizer(),
             ["integratedGpuCurveOptimizerCounts"] = ReadIntegratedGpuCurveOptimizer(),
             ["maxBoostFrequencyMhz"] = ReadMaxBoostFrequency()
@@ -153,9 +163,11 @@ internal sealed class CpuSession : IDisposable
     /// 写哪几条由主程序决定 —— 它们各有各的含义（持续、长时、瞬时），
     /// 替调用方"顺手都写了"就是把策略埋在这一侧。
     /// </summary>
-    public IReadOnlyDictionary<string, object?> SetPowerLimit(string which, double watts)
+    public IReadOnlyDictionary<string, object?> SetPowerLimit(string which, SmuValue value)
     {
         var target = Require();
+        // 这一条只收瓦。收到别的量纲说明上游搞错了项，不是我们该替它换算的事。
+        var watts = value.In(SmuUnits.Watt);
 
         /*
          * 直接发 MP1。
@@ -167,29 +179,30 @@ internal sealed class CpuSession : IDisposable
          * 命令号仍然用它维护的表（Mp1Smu.SMU_MSG_*），只是换一个邮箱，不硬写常量。
          * 表里没有这条命令时才退回它的通用接口。
          */
-        var mp1Message = which switch
+        // 命令号和它收的量纲一起挑出来 —— 分开写就会出现"改了命令忘了改量纲"。
+        // MP1 这几条收**毫瓦**；下面 ZenStates 的通用接口收**瓦**，是两回事。
+        var (mp1Message, mp1Unit) = which switch
         {
-            "stapm" => target.smu.Mp1Smu.SMU_MSG_SetStapmLimit,
-            "slow" => target.smu.Mp1Smu.SMU_MSG_SetSlowLimit,
-            "fast" => target.smu.Mp1Smu.SMU_MSG_SetFastLimit,
+            "stapm" => (target.smu.Mp1Smu.SMU_MSG_SetStapmLimit, SmuUnits.Milliwatt),
+            "slow" => (target.smu.Mp1Smu.SMU_MSG_SetSlowLimit, SmuUnits.Milliwatt),
+            "fast" => (target.smu.Mp1Smu.SMU_MSG_SetFastLimit, SmuUnits.Milliwatt),
             _ => throw new ArgumentException($"不认识的功耗项：{which}。")
         };
 
         SMU.Status status;
         if (mp1Message != 0)
         {
-            var arguments = Utils.MakeCmdArgs((uint)Math.Round(watts * 1000));
-            status = target.smu.SendMp1Command(mp1Message, ref arguments);
+            status = SendMp1(target, mp1Message, value, mp1Unit);
         }
         else
         {
             // 它的通用接口收的是**瓦**，内部自己乘 1000。
-            var value = (uint)Math.Round(watts);
+            var whole = (uint)Math.Round(watts);
             status = which switch
             {
-                "stapm" => target.SetStapmLimit(value),
-                "slow" => target.SetSlowLimit(value),
-                _ => target.SetFastLimit(value)
+                "stapm" => target.SetStapmLimit(whole),
+                "slow" => target.SetSlowLimit(whole),
+                _ => target.SetFastLimit(whole)
             };
         }
 
@@ -199,9 +212,106 @@ internal sealed class CpuSession : IDisposable
         {
             ["status"] = status.ToString(),
             ["mailbox"] = mp1Message != 0 ? "mp1" : "library",
+            // 发出去的到底是什么，原样回报 —— 主程序不该靠参数名反推量纲。
+            ["wroteNumber"] = value.Number,
+            ["wroteUnit"] = value.Unit,
+            ["sentAsUnit"] = mp1Message != 0 ? mp1Unit : SmuUnits.Watt,
             ["stapmLimitWatts"] = table?[StapmLimitIndex],
             ["fastLimitWatts"] = table?[FastLimitIndex],
             ["slowLimitWatts"] = table?[SlowLimitIndex]
+        };
+    }
+
+    /// <summary>
+    /// 一条电流墙。<paramref name="which"/> 是 tdc-vdd / tdc-soc / edc-vdd / edc-soc 之一。
+    ///
+    /// **和功耗墙一样走 MP1 优先。** 这一代移动端上 RSMU 会回一个假的 OK，
+    /// ZenStates 的通用路径「先 RSMU，成功就不试 MP1」于是永远轮不到真正管用的那条。
+    /// 命令号仍然用它维护的表，只是换一个邮箱。
+    /// </summary>
+    public IReadOnlyDictionary<string, object?> SetCurrentLimit(string which, SmuValue value)
+    {
+        var target = Require();
+        var amps = value.In(SmuUnits.Ampere);
+        // MP1 这几条收**毫安**；下面 ZenStates 的通用接口收**安**。
+        var (mp1Message, mp1Unit) = which switch
+        {
+            "tdc-vdd" => (target.smu.Mp1Smu.SMU_MSG_SetTDCVDDLimit, SmuUnits.Milliampere),
+            "tdc-soc" => (target.smu.Mp1Smu.SMU_MSG_SetTDCSocLimit, SmuUnits.Milliampere),
+            "edc-vdd" => (target.smu.Mp1Smu.SMU_MSG_SetEDCVDDLimit, SmuUnits.Milliampere),
+            "edc-soc" => (target.smu.Mp1Smu.SMU_MSG_SetEDCSocLimit, SmuUnits.Milliampere),
+            _ => throw new ArgumentException($"不认识的电流项：{which}。")
+        };
+
+        SMU.Status status;
+        if (mp1Message != 0)
+        {
+            status = SendMp1(target, mp1Message, value, mp1Unit);
+        }
+        else
+        {
+            // 它的通用接口收的是**安**，内部自己乘 1000。
+            var whole = (uint)Math.Round(amps);
+            status = which switch
+            {
+                "tdc-vdd" => target.SetTDCVDDLimit(whole),
+                "tdc-soc" => target.SetTDCSOCLimit(whole),
+                "edc-vdd" => target.SetEDCVDDLimit(whole),
+                _ => target.SetEDCSOCLimit(whole)
+            };
+        }
+
+        var table = ReadTable();
+        return new Dictionary<string, object?>
+        {
+            ["status"] = status.ToString(),
+            ["mailbox"] = mp1Message != 0 ? "mp1" : "library",
+            ["wroteNumber"] = value.Number,
+            ["wroteUnit"] = value.Unit,
+            ["sentAsUnit"] = mp1Message != 0 ? mp1Unit : SmuUnits.Ampere,
+            ["tdcLimitAmps"] = table?[TdcLimitIndex],
+            ["edcLimitAmps"] = table?[EdcLimitIndex]
+        };
+    }
+
+    /// <summary>
+    /// 温度墙（Tctl 上限，摄氏度）。
+    ///
+    /// **这一条没有回读。** 本机的 PM table 里还没认出哪一项是它 ——
+    /// 与其挑一个看着像温度的数当成上限报回去，不如如实说没有回读值，
+    /// 由主程序决定要不要信这个状态码。认出来之后再补。
+    /// </summary>
+    public IReadOnlyDictionary<string, object?> SetTemperatureLimit(SmuValue value)
+    {
+        var target = Require();
+        // 这一条走 ZenStates 自己的通用接口，收的是**摄氏度**，不是毫摄氏度。
+        var status = target.SetTctlMax(value.AsUInt32(SmuUnits.Celsius));
+        return new Dictionary<string, object?>
+        {
+            ["status"] = status.ToString(),
+            ["wroteNumber"] = value.Number,
+            ["wroteUnit"] = value.Unit,
+            ["sentAsUnit"] = SmuUnits.Celsius,
+            ["temperatureLimitCelsius"] = null
+        };
+    }
+
+    /// <summary>
+    /// PBO 标量（1~10 倍）。
+    ///
+    /// 它放宽的是固件那套可靠性预算（FIT）—— 倍数越大，固件越肯让电压和频率
+    /// 长时间待在高处。1 倍就是厂商默认，也就是不放宽。
+    /// </summary>
+    public IReadOnlyDictionary<string, object?> SetPowerBoostScalar(SmuValue value)
+    {
+        var target = Require();
+        var status = target.SetPBOScalar(value.AsUInt32(SmuUnits.Multiplier));
+        return new Dictionary<string, object?>
+        {
+            ["status"] = status.ToString(),
+            ["wroteNumber"] = value.Number,
+            ["wroteUnit"] = value.Unit,
+            ["sentAsUnit"] = SmuUnits.Multiplier
         };
     }
 
@@ -276,6 +386,30 @@ internal sealed class CpuSession : IDisposable
 
     private Cpu Require()
         => cpu ?? throw new InvalidOperationException(unavailableReason ?? "内核访问不可用。");
+
+    /// <summary>
+    /// 往 MP1 邮箱发一条带数值的命令。**所有走 MP1 的写入都必须经过这里。**
+    ///
+    /// **收的是带单位的值，不是裸数字。** 主程序那边每条设定本来就带着单位
+    /// （统一的 ControlUnits：W / A / °C / 档 / ×），这里就接着用同一个单位，
+    /// 由这一处把它换算成 MP1 要的毫单位。
+    ///
+    /// 先前的做法是参数名带量纲（<c>watts</c>、<c>amps</c>）、值是裸数字、
+    /// 每个调用点自己 `* 1000`。参数名写错不会报错，漏乘也不会报错 ——
+    /// 于是"把电流墙设成 85 A"安静地变成 0.085 A，处理器掉到二十几瓦，
+    /// 回执一路正常。**量纲必须跟着值走，并且只在一处换算。**
+    ///
+    /// 量纲由**每条命令自己声明**（见各处挑命令号的那个 switch），不是这里默认 ——
+    /// 命令号和量纲分开写，就会出现"改了命令忘了改量纲"。
+    ///
+    /// 换不过来就抛，不猜。**不在这里限制数值范围**：能调到多少是用户的事，
+    /// 由主程序那边的 ControlNumberRange 表达；这一层只负责把量纲送对。
+    /// </summary>
+    private static SMU.Status SendMp1(Cpu target, uint message, SmuValue value, string unit)
+    {
+        var arguments = Utils.MakeCmdArgs(value.AsUInt32(unit));
+        return target.smu.SendMp1Command(message, ref arguments);
+    }
 
     public void Dispose() => cpu?.Dispose();
 }
